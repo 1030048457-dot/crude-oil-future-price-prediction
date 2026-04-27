@@ -289,17 +289,29 @@ def train_model(model_class, df, features, window):
     data_X = scaler_X.fit_transform(df[features])
     data_y = scaler_y.fit_transform(df[[Config.TARGET_COL]])
 
-    train_size = int(len(data_X) * 0.8)
-    train_X, test_X = data_X[:train_size], data_X[train_size:]
-    train_y, test_y = data_y[:train_size], data_y[train_size:]
+    total_len = len(data_X)
+
+    # 按照 70% 训练集, 10% 验证集, 20% 测试集 划分
+    train_size = int(total_len * 0.7)
+    val_size = int(total_len * 0.1)
+
+    train_X = data_X[:train_size]
+    val_X = data_X[train_size: train_size + val_size]
+    test_X = data_X[train_size + val_size:]
+
+    train_y = data_y[:train_size]
+    val_y = data_y[train_size: train_size + val_size]
+    test_y = data_y[train_size + val_size:]
 
     train_ds = TimeSeriesDataset(train_X, train_y, window)
+    val_ds = TimeSeriesDataset(val_X, val_y, window)
     test_ds = TimeSeriesDataset(test_X, test_y, window)
 
     if len(train_ds) == 0 or len(test_ds) == 0:
         return 0.0, 0.0, [], []
 
     train_loader = DataLoader(train_ds, batch_size=Config.BATCH_SIZE, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=Config.BATCH_SIZE, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=Config.BATCH_SIZE, shuffle=False)
 
     model = model_class(len(features)).to(Config.DEVICE)
@@ -329,13 +341,13 @@ def train_model(model_class, df, features, window):
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for X_batch, y_batch in test_loader:
+            for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(Config.DEVICE), y_batch.to(Config.DEVICE)
                 pred = model(X_batch)
                 loss = criterion(pred.squeeze(), y_batch.squeeze())
                 val_loss += loss.item()
 
-        avg_val_loss = val_loss / len(test_loader)
+        avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
         scheduler.step(avg_val_loss)
         early_stopping(avg_val_loss, model)
 
@@ -378,10 +390,11 @@ def run_arima_rolling(df, window):
 
     data = df[Config.TARGET_COL].values
     total_len = len(data)
-    train_size = int(total_len * 0.8)
 
-    train_data = list(data[:train_size])
-    test_data = list(data[train_size:])
+    history_size = int(total_len * 0.7) + int(total_len * 0.1)
+
+    train_data = list(data[:history_size])
+    test_data = list(data[history_size:])
 
     if len(test_data) <= window:
         return 0.0, 0.0, [], []
@@ -405,6 +418,7 @@ def run_arima_rolling(df, window):
         # 真正滚动：加入真实值
         history.append(test_data[t])
 
+    # 丢弃前 window 个预测，以对齐深度学习模型中因滑动窗口损失的时间步
     predictions = np.array(predictions[window:])
     actuals = np.array(actuals[window:])
 
@@ -450,10 +464,13 @@ if __name__ == "__main__":
         print("错误：数据量太小。")
         sys.exit(1)
 
-    train_len_rough = int(total_len * 0.8)
-    test_len_rough = total_len - train_len_rough
+    # 计算划分长度以对齐输出日期
+    train_len_rough = int(total_len * 0.7)
+    val_len_rough = int(total_len * 0.1)
+    history_len = train_len_rough + val_len_rough
+    test_len_rough = total_len - history_len
 
-    print(f"Train size: {train_len_rough}, Test size: {test_len_rough}")
+    print(f"Train size: {train_len_rough}, Val size: {val_len_rough}, Test size: {test_len_rough}")
     print(f"ARIMA Order: {Config.ARIMA_ORDER}")
 
     # 指标结果表（仅打印，不保存 CSV）
@@ -476,8 +493,9 @@ if __name__ == "__main__":
         actual_values_full = df[Config.TARGET_COL].values
         dates_full = df['trade_date'].values
 
-        start_idx = train_len_rough + w
-        end_idx = train_len_rough + w + dl_test_len
+        # 对齐测试集的日期和真实值
+        start_idx = history_len + w
+        end_idx = total_len
 
         current_dates = dates_full[start_idx:end_idx]
         actual_values = actual_values_full[start_idx:end_idx]
